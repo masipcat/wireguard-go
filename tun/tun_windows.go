@@ -36,7 +36,6 @@ type exchgBufWrite struct {
 
 type NativeTun struct {
 	wt        *wintun.Wintun
-	tunName   string
 	tunFile   *os.File
 	tunLock   sync.Mutex
 	rdBuff    *exchgBufRead
@@ -83,51 +82,21 @@ func CreateTUN(ifname string) (TUNDevice, error) {
 		return nil, errors.New("Flushing interface failed: " + err.Error())
 	}
 
+	file, err := os.OpenFile(wt.DataFileName(), os.O_RDWR, 0)
+	if err != nil {
+		wt.DeleteInterface(0)
+		return nil, errors.New("Unable to open data file for TUN interface: " + err.Error())
+	}
+
 	return &NativeTun{
 		wt:        wt,
-		tunName:   wt.DataFileName(),
+		tunFile:   file,
 		rdBuff:    &exchgBufRead{},
 		wrBuff:    &exchgBufWrite{},
 		events:    make(chan TUNEvent, 10),
 		errors:    make(chan error, 1),
 		forcedMtu: 1500,
 	}, nil
-}
-
-func (tun *NativeTun) openTUN() {
-	for {
-		file, err := os.OpenFile(tun.tunName, os.O_RDWR, 0)
-		if err != nil {
-			continue
-		}
-		tun.tunFile = file
-	}
-}
-
-func (tun *NativeTun) closeTUN() (err error) {
-	if tun.tunFile != nil {
-		tun.tunLock.Lock()
-		defer tun.tunLock.Unlock()
-		if tun.tunFile == nil {
-			return
-		}
-		t := tun.tunFile
-		tun.tunFile = nil
-		err = t.Close()
-	}
-	return
-}
-
-func (tun *NativeTun) getTUN() (*os.File, error) {
-	if tun.tunFile == nil {
-		tun.tunLock.Lock()
-		defer tun.tunLock.Unlock()
-		if tun.tunFile != nil {
-			return tun.tunFile, nil
-		}
-		tun.openTUN()
-	}
-	return tun.tunFile, nil
 }
 
 func (tun *NativeTun) Name() (string, error) {
@@ -143,17 +112,14 @@ func (tun *NativeTun) Events() chan TUNEvent {
 }
 
 func (tun *NativeTun) Close() error {
-	err1 := tun.closeTUN()
-
+	err1 := tun.tunFile.Close()
 	if tun.events != nil {
 		close(tun.events)
 	}
-
 	_, _, err2 := tun.wt.DeleteInterface(0)
 	if err1 == nil {
 		err1 = err2
 	}
-
 	return err1
 }
 
@@ -192,22 +158,10 @@ func (tun *NativeTun) Read(buff []byte, offset int) (int, error) {
 			return int(size), nil
 		}
 
-		// Get TUN data pipe.
-		file, err := tun.getTUN()
+		// Fill queue.
+		n, err := tun.tunFile.Read(tun.rdBuff.data[:])
 		if err != nil {
 			return 0, err
-		}
-
-		// Fill queue.
-		n, err := file.Read(tun.rdBuff.data[:])
-		if err != nil {
-			if pe, ok := err.(*os.PathError); ok && pe.Err == os.ErrClosed {
-				return 0, err
-			}
-			// TUN interface stopped, failed, etc. Retry.
-			tun.rdBuff.avail = 0
-			tun.closeTUN()
-			continue
 		}
 		tun.rdBuff.offset = 0
 		tun.rdBuff.avail = uint32(n)
@@ -215,25 +169,11 @@ func (tun *NativeTun) Read(buff []byte, offset int) (int, error) {
 }
 
 // Note: flush() and putTunPacket() assume the caller comes only from a single thread; there's no locking.
-
 func (tun *NativeTun) flush() error {
-	// Get TUN data pipe.
-	file, err := tun.getTUN()
-	if err != nil {
-		return err
-	}
-
-	// Flush write buffer.
-	_, err = file.Write(tun.wrBuff.data[:tun.wrBuff.offset])
+	_, err := tun.tunFile.Write(tun.wrBuff.data[:tun.wrBuff.offset])
 	tun.wrBuff.packetNum = 0
 	tun.wrBuff.offset = 0
-	if err != nil {
-		// TUN interface stopped, failed, etc. Drop.
-		tun.closeTUN()
-		return err
-	}
-
-	return nil
+	return err
 }
 
 func (tun *NativeTun) putTunPacket(buff []byte) error {
@@ -273,6 +213,7 @@ func (tun *NativeTun) Write(buff []byte, offset int) (int, error) {
 	}
 
 	// Flush write buffer.
+	//TODO: don't flush every time
 	return len(buff) - offset, tun.flush()
 }
 
